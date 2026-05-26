@@ -379,5 +379,394 @@ def descargar_clasificacion():
     )
 
 
+# ── PEM Helpers ───────────────────────────────────────────────────────────────
+
+# Mapeo: columna base maestra → columna en avance PEM
+PEM_COLUMN_MAP = {
+    "EXPEDIENTE":                    "N° EXP.",
+    "AGRUPACIONES":                  "AGRUPACIÓN DE VIVIENDA",
+    "DISTRITO":                      "DISTRITO DE OBRA",
+    "% DE AVANCE":                   "AVANCE",
+    "FECHA PUSER (REDES BT)":        "Fecha P/S Real",
+    "LOTES PLANO":                   "LOTES",
+    "LOTES ELECTRIFICADOS":          "LOTES PROYECTO",
+    "ESTADO DE SOLICITUD":           "STATUS",
+    "REPRESENTANTE POB":             "REPRESENTANTE",
+    "TELEFONO":                      "TELÉFONO",
+    "COGEPULP":                      "COGEPULP",
+}
+
+# Inverso: PEM header → base header
+PEM_TO_BASE = {v: k for k, v in PEM_COLUMN_MAP.items()}
+
+# Columnas almacenadas como decimal en la base maestra (formato porcentaje)
+PERCENT_COLUMNS = {"% de avance"}
+
+
+def parse_percent_to_decimal(val):
+    """'75%' | '75' | 75 | 0.75  →  0.75 (decimal). '' | None → None."""
+    if val is None or val == "":
+        return None
+    s = str(val).strip().replace("%", "").strip()
+    if s == "":
+        return None
+    try:
+        n = float(s)
+        return round(n / 100, 6) if n > 1 else round(n, 6)
+    except ValueError:
+        return None
+
+
+def format_percent_display(val):
+    """0.75 → '75%'  para mostrar en el preview"""
+    if val is None or val == "":
+        return "—"
+    try:
+        return f"{round(float(val) * 100, 2):g}%"
+    except (ValueError, TypeError):
+        return str(val)
+
+
+def normalize_header(text):
+    """Normaliza un header: quita saltos de línea, espacios extra, strip."""
+    if text is None:
+        return ""
+    return " ".join(str(text).replace("\n", " ").replace("\r", " ").split()).strip()
+
+
+def copy_cell_style(src, dst):
+    """Copia estilos básicos de una celda a otra."""
+    from copy import copy
+    if src.has_style:
+        dst.font = copy(src.font)
+        dst.fill = copy(src.fill)
+        dst.border = copy(src.border)
+        dst.alignment = copy(src.alignment)
+        dst.number_format = src.number_format
+
+
+# ── PEM Endpoints ─────────────────────────────────────────────────────────────
+
+# Almacenamiento temporal en memoria (por sesión de servidor)
+_pem_store = {}
+
+
+@app.route("/api/pem/upload-base", methods=["POST"])
+def pem_upload_base():
+    """Recibe la base maestra y devuelve metadata de la hoja POBLACIONES."""
+    if "file" not in request.files:
+        return jsonify({"error": "No se recibió ningún archivo"}), 400
+
+    file = request.files["file"]
+    if not file.filename.endswith(".xlsx"):
+        return jsonify({"error": "Solo se aceptan archivos .xlsx"}), 400
+
+    try:
+        content = file.read()
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+
+        SHEET_NAME = "POBLACIONES 2021-2026"
+        if SHEET_NAME not in wb.sheetnames:
+            return jsonify({"error": f"No se encontró la hoja '{SHEET_NAME}'"}), 400
+
+        ws = wb[SHEET_NAME]
+
+        # Leer headers de la primera fila no vacía
+        headers = []
+        header_row_idx = None
+        for row in ws.iter_rows():
+            non_empty = [c for c in row if c.value is not None]
+            if non_empty:
+                headers = [normalize_header(c.value) for c in row]
+                header_row_idx = row[0].row
+                break
+
+        if not headers:
+            return jsonify({"error": "La hoja no contiene datos"}), 400
+
+        if "EXPEDIENTE" not in headers:
+            return jsonify({"error": "No se encontró la columna 'EXPEDIENTE' en la base maestra"}), 400
+
+        # Contar filas de datos
+        total_rows = sum(
+            1 for row in ws.iter_rows(min_row=header_row_idx + 1)
+            if any(c.value is not None for c in row)
+        )
+
+        # Guardar en memoria
+        _pem_store["base_content"] = content
+        _pem_store["base_filename"] = file.filename
+        _pem_store["base_headers"] = headers
+        _pem_store["base_header_row"] = header_row_idx
+
+        return jsonify({
+            "filename": file.filename,
+            "total": total_rows,
+            "headers": headers,
+            "sheetNames": wb.sheetnames,
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Error al procesar el archivo: {str(e)}"}), 500
+
+
+@app.route("/api/pem/upload-avance", methods=["POST"])
+def pem_upload_avance():
+    """
+    Recibe el avance PEM, reconcilia con la base y devuelve preview de cambios.
+    """
+    if "base_content" not in _pem_store:
+        return jsonify({"error": "Primero sube la base maestra"}), 400
+
+    if "file" not in request.files:
+        return jsonify({"error": "No se recibió ningún archivo"}), 400
+
+    file = request.files["file"]
+    if not file.filename.endswith(".xlsx"):
+        return jsonify({"error": "Solo se aceptan archivos .xlsx"}), 400
+
+    try:
+        # ── Leer avance PEM ───────────────────────────────────────────────────
+        pem_content = file.read()
+        wb_pem = openpyxl.load_workbook(io.BytesIO(pem_content), data_only=True)
+
+        SHEET_PEM = "Reporte APC 2026"
+        if SHEET_PEM not in wb_pem.sheetnames:
+            return jsonify({"error": f"No se encontró la hoja '{SHEET_PEM}' en el avance PEM"}), 400
+
+        ws_pem = wb_pem[SHEET_PEM]
+
+        # Saltar primeras 2 filas — headers en fila 3
+        all_rows = list(ws_pem.iter_rows(values_only=False))
+        if len(all_rows) < 3:
+            return jsonify({"error": "El avance PEM no tiene suficientes filas"}), 400
+
+        header_cells = all_rows[2]  # fila índice 2 = fila 3
+        pem_headers_raw = [normalize_header(c.value) for c in header_cells]
+
+        # Detectar columna sin nombre al final (para PARALIZADO)
+        # Buscar la última columna que tenga valor no vacío en el header
+        last_named_col = max(
+            (i for i, h in enumerate(pem_headers_raw) if h),
+            default=len(pem_headers_raw) - 1
+        )
+        # La columna "sin nombre" es la siguiente, si existe
+        paralizado_col_idx = last_named_col + 1 if last_named_col + 1 < len(pem_headers_raw) else None
+
+        # Verificar que exista N° EXP. en PEM
+        if "N° EXP." not in pem_headers_raw:
+            return jsonify({"error": "No se encontró la columna 'N° EXP.' en el avance PEM"}), 400
+
+        exp_pem_idx = pem_headers_raw.index("N° EXP.")
+
+        # ── Leer base maestra ─────────────────────────────────────────────────
+        wb_base = openpyxl.load_workbook(io.BytesIO(_pem_store["base_content"]), data_only=True)
+        ws_base = wb_base["POBLACIONES 2021-2026"]
+        base_headers = _pem_store["base_headers"]
+        base_header_row = _pem_store["base_header_row"]
+        exp_base_idx = base_headers.index("EXPEDIENTE")
+
+        # Construir índice base: expediente → {col: valor}
+        base_index = {}
+        base_row_map = {}  # expediente → número de fila en Excel
+        for row in ws_base.iter_rows(min_row=base_header_row + 1):
+            if all(c.value is None for c in row):
+                continue
+            exp_val = normalize_header(row[exp_base_idx].value) if row[exp_base_idx].value else ""
+            if not exp_val:
+                continue
+            row_data = {base_headers[i]: ("" if cell.value is None else cell.value)
+                        for i, cell in enumerate(row) if i < len(base_headers)}
+            base_index[exp_val] = row_data
+            base_row_map[exp_val] = row[0].row
+
+        # ── Procesar filas PEM ────────────────────────────────────────────────
+        updated = []
+        added = []
+        skipped_paralizado = 0
+
+        for row_cells in all_rows[3:]:  # desde fila 4 en adelante
+            if all(c.value is None for c in row_cells):
+                continue
+
+            # Chequear columna PARALIZADO
+            if paralizado_col_idx is not None and paralizado_col_idx < len(row_cells):
+                paralizado_val = str(row_cells[paralizado_col_idx].value or "").strip().upper()
+                if "PARALIZADO" in paralizado_val:
+                    skipped_paralizado += 1
+                    continue
+
+            pem_row = {pem_headers_raw[i]: (c.value if c.value is not None else "")
+                       for i, c in enumerate(row_cells) if i < len(pem_headers_raw) and pem_headers_raw[i]}
+
+            exp_val = normalize_header(str(pem_row.get("N° EXP.", "") or ""))
+            if not exp_val:
+                continue
+
+            # Construir el dict de campos a actualizar (mapeados a nombre base)
+            # Para columnas porcentaje, almacenar el valor como decimal
+            mapped_changes = {}
+            for pem_col, base_col in PEM_TO_BASE.items():
+                if pem_col in pem_row and pem_col != "N° EXP.":
+                    raw = pem_row[pem_col]
+                    if base_col in PERCENT_COLUMNS:
+                        mapped_changes[base_col] = parse_percent_to_decimal(raw)
+                    else:
+                        mapped_changes[base_col] = str(raw).strip() if raw != "" else ""
+
+            if exp_val in base_index:
+                # Detectar qué campos realmente cambian
+                changes = []
+                for base_col, new_val in mapped_changes.items():
+                    raw_old = base_index[exp_val].get(base_col, "")
+
+                    if base_col in PERCENT_COLUMNS:
+                        old_dec = parse_percent_to_decimal(raw_old)
+                        new_dec = new_val  # ya es decimal
+                        # Normalizar: None y 0.0 son equivalentes (celda vacía con formato %)
+                        old_norm = old_dec if old_dec is not None else None
+                        new_norm = new_dec if new_dec is not None else None
+                        if (old_norm or 0.0) != (new_norm or 0.0):
+                            changes.append({
+                                "field": base_col,
+                                "before": format_percent_display(old_dec),
+                                "after": format_percent_display(new_dec),
+                            })
+                    else:
+                        old_val = str(raw_old or "").strip()
+                        new_val_str = str(new_val).strip() if new_val is not None else ""
+                        if old_val != new_val_str:
+                            changes.append({
+                                "field": base_col,
+                                "before": old_val,
+                                "after": new_val_str,
+                            })
+                if changes:
+                    agrupacion = str(base_index[exp_val].get("AGRUPACIONES", exp_val)).strip()
+                    updated.append({
+                        "expediente": exp_val,
+                        "agrupacion": agrupacion,
+                        "changes": changes,
+                        "mapped": mapped_changes,
+                    })
+            else:
+                # Nueva agrupación
+                new_row = {}
+                for pem_col, base_col in PEM_TO_BASE.items():
+                    new_row[base_col] = str(pem_row.get(pem_col, "") or "").strip()
+                agrupacion = new_row.get("AGRUPACIONES", exp_val)
+                added.append({
+                    "expediente": exp_val,
+                    "agrupacion": agrupacion,
+                    "fields": new_row,
+                })
+
+        # Guardar datos para el endpoint de descarga
+        _pem_store["pem_content"] = pem_content
+        _pem_store["updated"] = updated
+        _pem_store["added"] = added
+        _pem_store["base_row_map"] = base_row_map
+        _pem_store["pem_filename"] = file.filename
+
+        return jsonify({
+            "updated": updated,
+            "added": added,
+            "skippedParalizado": skipped_paralizado,
+            "totalPem": len(updated) + len(added) + skipped_paralizado,
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({"error": f"Error al procesar el avance: {str(e)}", "detail": traceback.format_exc()}), 500
+
+
+@app.route("/api/pem/descargar", methods=["POST"])
+def pem_descargar():
+    """
+    Aplica los cambios a la base maestra y devuelve el Excel actualizado,
+    conservando formato y todas las hojas.
+    """
+    if "base_content" not in _pem_store or "updated" not in _pem_store:
+        return jsonify({"error": "No hay datos para procesar"}), 400
+
+    try:
+        from copy import copy
+
+        # Cargar base con estilos
+        wb = openpyxl.load_workbook(io.BytesIO(_pem_store["base_content"]))
+        ws = wb["POBLACIONES 2021-2026"]
+        base_headers = _pem_store["base_headers"]
+        base_header_row = _pem_store["base_header_row"]
+        base_row_map = _pem_store["base_row_map"]
+        updated = _pem_store["updated"]
+        added = _pem_store["added"]
+
+        # Índice columna: nombre → índice (0-based)
+        col_idx_map = {h: i for i, h in enumerate(base_headers)}
+
+        # ── Aplicar actualizaciones ───────────────────────────────────────────
+        for item in updated:
+            exp = item["expediente"]
+            row_num = base_row_map.get(exp)
+            if row_num is None:
+                continue
+            for base_col, new_val in item["mapped"].items():
+                if base_col not in col_idx_map:
+                    continue
+                col_num = col_idx_map[base_col] + 1  # openpyxl es 1-based
+                cell = ws.cell(row=row_num, column=col_num)
+                if base_col in PERCENT_COLUMNS:
+                    # Escribir como decimal; el formato de celda ya es porcentaje
+                    cell.value = new_val  # None si vacío, float si tiene valor
+                else:
+                    cell.value = new_val if new_val != "" else None
+
+        # ── Agregar nuevas filas ──────────────────────────────────────────────
+        # Encontrar la última fila con datos
+        last_data_row = base_header_row
+        for row in ws.iter_rows(min_row=base_header_row + 1):
+            if any(c.value is not None for c in row):
+                last_data_row = row[0].row
+
+        # Tomar la última fila de datos como plantilla de estilo
+        template_row = last_data_row
+
+        for item in added:
+            new_row_num = last_data_row + 1
+            last_data_row = new_row_num
+
+            for col_idx, base_col in enumerate(base_headers):
+                col_num = col_idx + 1
+                raw_val = item["fields"].get(base_col, "")
+                cell = ws.cell(row=new_row_num, column=col_num)
+
+                # Copiar estilo de la plantilla primero (incluye number_format)
+                template_cell = ws.cell(row=template_row, column=col_num)
+                copy_cell_style(template_cell, cell)
+
+                if base_col in PERCENT_COLUMNS:
+                    cell.value = parse_percent_to_decimal(raw_val)
+                else:
+                    cell.value = raw_val if raw_val != "" else None
+
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        base_name = _pem_store.get("base_filename", "base_actualizada.xlsx")
+        download_name = base_name.replace(".xlsx", "_actualizada.xlsx")
+
+        return send_file(
+            output,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=download_name,
+        )
+
+    except Exception as e:
+        import traceback
+        return jsonify({"error": f"Error al generar el archivo: {str(e)}", "detail": traceback.format_exc()}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

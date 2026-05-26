@@ -115,6 +115,7 @@ export default function App() {
 
         <div className="flex items-center gap-3">
           {/* Indicador de proyectista activo */}
+          
           {selectedProyectista && (
             <div className="flex items-center gap-2">
               <span className="text-xs text-gray-400">Proyectista:</span>
