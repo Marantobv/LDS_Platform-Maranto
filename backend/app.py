@@ -6,6 +6,7 @@ from openpyxl.styles import PatternFill, Font
 import io
 import requests
 import unicodedata
+from datetime import date
 
 app = Flask(__name__)
 CORS(app)
@@ -19,7 +20,7 @@ def is_red_font(cell):
         font = cell.font
         if font is None:
             return False
-        color = font.color
+        color = font.colors
         if color is None:
             return False
         if color.type == "rgb" and color.rgb:
@@ -390,7 +391,7 @@ PEM_COLUMN_MAP = {
     "FECHA PUSER (REDES BT)":        "Fecha P/S Real",
     "LOTES PLANO":                   "LOTES",
     "LOTES ELECTRIFICADOS":          "LOTES PROYECTO",
-    "ESTADO DE SOLICITUD":           "STATUS",
+    "ESTADO DE OBRA":                "STATUS",
     "REPRESENTANTE POB":             "REPRESENTANTE",
     "TELEFONO":                      "TELÉFONO",
     "COGEPULP":                      "COGEPULP",
@@ -400,7 +401,31 @@ PEM_COLUMN_MAP = {
 PEM_TO_BASE = {v: k for k, v in PEM_COLUMN_MAP.items()}
 
 # Columnas almacenadas como decimal en la base maestra (formato porcentaje)
-PERCENT_COLUMNS = {"% de avance"}
+PERCENT_COLUMNS = {"% DE AVANCE"}
+
+# No sobrescribir en filas existentes (EXPEDIENTE ya encontrado en la base)
+SKIP_ON_EXISTING_UPDATE = {"AGRUPACIONES"}
+
+PUSER_CONFIRMATION_COLUMN = "CONFIRMACION DE PROYECTOS (PUSER)"
+
+# PEM y base usan distintos términos para el mismo valor → no disparar actualización
+COLUMN_VALUE_EQUIVALENTS = {
+    "ESTADO DE OBRA": {
+        "FINALIZADO": "TERMINADO",
+        "TERMINADO": "TERMINADO",
+        "PARALIZADO": "PARALIZADO",
+        "PARALIZADO OBRA": "PARALIZADO",
+        "PARALIZADO PROYECTO": "PARALIZADO",
+    },
+}
+
+# Valor a escribir en la base cuando el PEM usa un sinónimo
+COLUMN_WRITE_CANONICAL = {
+    "ESTADO DE OBRA": {
+        "TERMINADO": "Terminado",
+        "PARALIZADO": "Paralizado",
+    },
+}
 
 
 def parse_percent_to_decimal(val):
@@ -432,6 +457,83 @@ def normalize_header(text):
     if text is None:
         return ""
     return " ".join(str(text).replace("\n", " ").replace("\r", " ").split()).strip()
+
+
+def normalize_column_value(base_col, val):
+    """Normaliza un valor de celda para comparar; aplica sinónimos conocidos."""
+    s = str(val or "").strip().upper()
+    equiv = COLUMN_VALUE_EQUIVALENTS.get(base_col)
+    if equiv:
+        return equiv.get(s, s)
+    return s
+
+
+def values_equivalent(base_col, old_val, new_val):
+    """True si ambos valores representan lo mismo (p. ej. Finalizado = Terminado)."""
+    return normalize_column_value(base_col, old_val) == normalize_column_value(base_col, new_val)
+
+
+def resolve_column_write_value(base_col, val):
+    """Convierte sinónimos PEM al texto canónico de la base (p. ej. Paralizado proyecto → Paralizado)."""
+    s = str(val or "").strip()
+    if not s:
+        return ""
+    key = s.upper()
+    equiv = COLUMN_VALUE_EQUIVALENTS.get(base_col)
+    if not equiv or key not in equiv:
+        return s
+    canonical_key = equiv[key]
+    display = COLUMN_WRITE_CANONICAL.get(base_col, {}).get(canonical_key)
+    return display if display else s
+
+
+def is_percent_100(val):
+    """True si el valor representa 100% (1.0 decimal, '100%', etc.)."""
+    if isinstance(val, (int, float)):
+        return float(val) >= 1.0 - 1e-6
+    dec = parse_percent_to_decimal(val)
+    return dec is not None and dec >= 1.0 - 1e-6
+
+
+def estado_indicates_full_completion(val):
+    """ESTADO DE OBRA al 100% o estado de obra terminada."""
+    if is_percent_100(val):
+        return True
+    norm = normalize_column_value("ESTADO DE OBRA", val)
+    return norm in ("TERMINADO", "FINALIZADO")
+
+
+def maybe_append_puser_confirmation(changes, mapped_changes, base_row):
+    """
+    Si ESTADO DE OBRA se actualiza a obra terminada y % DE AVANCE es 100%,
+    fija CONFIRMACION DE PROYECTOS (PUSER) con la fecha de hoy (dd/mm/YYYY).
+    """
+    if not any(c["field"] == "ESTADO DE OBRA" for c in changes):
+        return
+
+    avance = mapped_changes.get("% DE AVANCE")
+    if avance is None:
+        avance = parse_percent_to_decimal(base_row.get("% DE AVANCE"))
+    if not is_percent_100(avance):
+        return
+
+    estado_new = mapped_changes.get("ESTADO DE OBRA")
+    if not estado_new:
+        estado_new = str(base_row.get("ESTADO DE OBRA", "") or "").strip()
+    if not estado_indicates_full_completion(estado_new):
+        return
+
+    today = date.today().strftime("%d/%m/%Y")
+    old = str(base_row.get(PUSER_CONFIRMATION_COLUMN, "") or "").strip()
+    if old == today:
+        return
+
+    changes.append({
+        "field": PUSER_CONFIRMATION_COLUMN,
+        "before": old or "—",
+        "after": today,
+    })
+    mapped_changes[PUSER_CONFIRMATION_COLUMN] = today
 
 
 def copy_cell_style(src, dst):
@@ -612,12 +714,16 @@ def pem_upload_avance():
                     if base_col in PERCENT_COLUMNS:
                         mapped_changes[base_col] = parse_percent_to_decimal(raw)
                     else:
-                        mapped_changes[base_col] = str(raw).strip() if raw != "" else ""
+                        raw_str = str(raw).strip() if raw != "" else ""
+                        mapped_changes[base_col] = resolve_column_write_value(base_col, raw_str)
 
             if exp_val in base_index:
                 # Detectar qué campos realmente cambian
                 changes = []
                 for base_col, new_val in mapped_changes.items():
+                    if base_col in SKIP_ON_EXISTING_UPDATE:
+                        continue
+
                     raw_old = base_index[exp_val].get(base_col, "")
 
                     if base_col in PERCENT_COLUMNS:
@@ -635,19 +741,25 @@ def pem_upload_avance():
                     else:
                         old_val = str(raw_old or "").strip()
                         new_val_str = str(new_val).strip() if new_val is not None else ""
-                        if old_val != new_val_str:
+                        if not values_equivalent(base_col, old_val, new_val_str):
                             changes.append({
                                 "field": base_col,
                                 "before": old_val,
                                 "after": new_val_str,
                             })
+
+                maybe_append_puser_confirmation(changes, mapped_changes, base_index[exp_val])
+
                 if changes:
                     agrupacion = str(base_index[exp_val].get("AGRUPACIONES", exp_val)).strip()
                     updated.append({
                         "expediente": exp_val,
                         "agrupacion": agrupacion,
                         "changes": changes,
-                        "mapped": mapped_changes,
+                        "mapped": {
+                            k: v for k, v in mapped_changes.items()
+                            if k not in SKIP_ON_EXISTING_UPDATE
+                        },
                     })
             else:
                 # Nueva agrupación
@@ -710,9 +822,13 @@ def pem_descargar():
             row_num = base_row_map.get(exp)
             if row_num is None:
                 continue
-            for base_col, new_val in item["mapped"].items():
+            for change in item["changes"]:
+                base_col = change["field"]
+                if base_col in SKIP_ON_EXISTING_UPDATE:
+                    continue
                 if base_col not in col_idx_map:
                     continue
+                new_val = item["mapped"].get(base_col)
                 col_num = col_idx_map[base_col] + 1  # openpyxl es 1-based
                 cell = ws.cell(row=row_num, column=col_num)
                 if base_col in PERCENT_COLUMNS:
