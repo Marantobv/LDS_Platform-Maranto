@@ -4,6 +4,7 @@ from flask_cors import CORS
 import openpyxl
 from openpyxl.styles import PatternFill, Font
 import io
+import re
 import requests
 import unicodedata
 from datetime import date
@@ -403,6 +404,9 @@ PEM_TO_BASE = {v: k for k, v in PEM_COLUMN_MAP.items()}
 # Columnas almacenadas como decimal en la base maestra (formato porcentaje)
 PERCENT_COLUMNS = {"% DE AVANCE"}
 
+# Celda PEM vacía no sobrescribe un valor ya existente en la base
+KEEP_IF_PEM_BLANK = {"% DE AVANCE", "FECHA PUSER (REDES BT)"}
+
 # No sobrescribir en filas existentes (EXPEDIENTE ya encontrado en la base)
 SKIP_ON_EXISTING_UPDATE = {"AGRUPACIONES"}
 
@@ -428,6 +432,12 @@ COLUMN_WRITE_CANONICAL = {
 }
 
 
+def _single_percent_to_decimal(n):
+    """Convierte un número suelto a decimal Excel (75 → 0.75, 0.75 → 0.75)."""
+    n = float(n)
+    return round(n / 100, 6) if n > 1 else round(n, 6)
+
+
 def parse_percent_to_decimal(val):
     """'75%' | '75' | 75 | 0.75  →  0.75 (decimal). '' | None → None."""
     if val is None or val == "":
@@ -436,10 +446,34 @@ def parse_percent_to_decimal(val):
     if s == "":
         return None
     try:
-        n = float(s)
-        return round(n / 100, 6) if n > 1 else round(n, 6)
+        return _single_percent_to_decimal(float(s.replace(",", ".")))
     except ValueError:
         return None
+
+
+def parse_pem_avance_to_decimal(val):
+    """AVANCE PEM: '90%20%' (con saltos de línea) → menor %; un solo valor como la base."""
+    if pem_cell_is_blank(val):
+        return None
+    s = normalize_header(str(val))
+    matches = re.findall(r"(\d+(?:[.,]\d+)?)\s*%", s)
+    if matches:
+        return min(
+            _single_percent_to_decimal(float(m.replace(",", ".")))
+            for m in matches
+        )
+    return parse_percent_to_decimal(val)
+
+
+def effective_avance_decimal(mapped_changes, base_row):
+    """Avance efectivo para reglas (no usar un PEM menor si la base ya es mayor)."""
+    new_dec = mapped_changes.get("% DE AVANCE")
+    old_dec = parse_percent_to_decimal(base_row.get("% DE AVANCE"))
+    if new_dec is None:
+        return old_dec
+    if old_dec is None:
+        return new_dec
+    return max(old_dec, new_dec)
 
 
 def format_percent_display(val):
@@ -473,6 +507,17 @@ def values_equivalent(base_col, old_val, new_val):
     return normalize_column_value(base_col, old_val) == normalize_column_value(base_col, new_val)
 
 
+def skip_field_on_existing_update(base_col, base_value):
+    """Campos que no deben sobrescribirse en filas ya existentes en la base."""
+    if base_col in SKIP_ON_EXISTING_UPDATE:
+        return True
+    if base_col == "ESTADO DE OBRA":
+        return normalize_column_value(
+            "ESTADO DE OBRA", str(base_value or "").strip()
+        ) == "TERMINADO"
+    return False
+
+
 def resolve_column_write_value(base_col, val):
     """Convierte sinónimos PEM al texto canónico de la base (p. ej. Paralizado proyecto → Paralizado)."""
     s = str(val or "").strip()
@@ -495,32 +540,31 @@ def is_percent_100(val):
     return dec is not None and dec >= 1.0 - 1e-6
 
 
-def estado_indicates_full_completion(val):
-    """ESTADO DE OBRA al 100% o estado de obra terminada."""
-    if is_percent_100(val):
+def pem_cell_is_blank(val):
+    """True si la celda PEM viene vacía (no debe sobrescribir la base)."""
+    if val is None:
         return True
-    norm = normalize_column_value("ESTADO DE OBRA", val)
-    return norm in ("TERMINADO", "FINALIZADO")
+    return str(val).strip() == ""
 
 
 def maybe_append_puser_confirmation(changes, mapped_changes, base_row):
     """
-    Si ESTADO DE OBRA se actualiza a obra terminada y % DE AVANCE es 100%,
-    fija CONFIRMACION DE PROYECTOS (PUSER) con la fecha de hoy (dd/mm/YYYY).
+    Fija CONFIRMACION DE PROYECTOS (PUSER) con la fecha de hoy solo cuando
+    ESTADO DE OBRA pasa a Terminado (no si ya lo era) y % DE AVANCE es 100%.
     """
     if not any(c["field"] == "ESTADO DE OBRA" for c in changes):
         return
 
-    avance = mapped_changes.get("% DE AVANCE")
-    if avance is None:
-        avance = parse_percent_to_decimal(base_row.get("% DE AVANCE"))
-    if not is_percent_100(avance):
+    old_estado = str(base_row.get("ESTADO DE OBRA", "") or "").strip()
+    if normalize_column_value("ESTADO DE OBRA", old_estado) == "TERMINADO":
         return
 
-    estado_new = mapped_changes.get("ESTADO DE OBRA")
-    if not estado_new:
-        estado_new = str(base_row.get("ESTADO DE OBRA", "") or "").strip()
-    if not estado_indicates_full_completion(estado_new):
+    estado_new = mapped_changes.get("ESTADO DE OBRA", "")
+    if normalize_column_value("ESTADO DE OBRA", estado_new) != "TERMINADO":
+        return
+
+    avance = effective_avance_decimal(mapped_changes, base_row)
+    if not is_percent_100(avance):
         return
 
     today = date.today().strftime("%d/%m/%Y")
@@ -711,8 +755,10 @@ def pem_upload_avance():
             for pem_col, base_col in PEM_TO_BASE.items():
                 if pem_col in pem_row and pem_col != "N° EXP.":
                     raw = pem_row[pem_col]
+                    if pem_cell_is_blank(raw) and base_col in KEEP_IF_PEM_BLANK:
+                        continue
                     if base_col in PERCENT_COLUMNS:
-                        mapped_changes[base_col] = parse_percent_to_decimal(raw)
+                        mapped_changes[base_col] = parse_pem_avance_to_decimal(raw)
                     else:
                         raw_str = str(raw).strip() if raw != "" else ""
                         mapped_changes[base_col] = resolve_column_write_value(base_col, raw_str)
@@ -721,14 +767,21 @@ def pem_upload_avance():
                 # Detectar qué campos realmente cambian
                 changes = []
                 for base_col, new_val in mapped_changes.items():
-                    if base_col in SKIP_ON_EXISTING_UPDATE:
-                        continue
-
                     raw_old = base_index[exp_val].get(base_col, "")
+                    if skip_field_on_existing_update(base_col, raw_old):
+                        continue
 
                     if base_col in PERCENT_COLUMNS:
                         old_dec = parse_percent_to_decimal(raw_old)
                         new_dec = new_val  # ya es decimal
+                        if new_dec is None and old_dec is not None:
+                            continue
+                        if (
+                            old_dec is not None
+                            and new_dec is not None
+                            and new_dec < old_dec - 1e-9
+                        ):
+                            continue
                         # Normalizar: None y 0.0 son equivalentes (celda vacía con formato %)
                         old_norm = old_dec if old_dec is not None else None
                         new_norm = new_dec if new_dec is not None else None
@@ -741,6 +794,8 @@ def pem_upload_avance():
                     else:
                         old_val = str(raw_old or "").strip()
                         new_val_str = str(new_val).strip() if new_val is not None else ""
+                        if not new_val_str and old_val and base_col in KEEP_IF_PEM_BLANK:
+                            continue
                         if not values_equivalent(base_col, old_val, new_val_str):
                             changes.append({
                                 "field": base_col,
@@ -758,7 +813,9 @@ def pem_upload_avance():
                         "changes": changes,
                         "mapped": {
                             k: v for k, v in mapped_changes.items()
-                            if k not in SKIP_ON_EXISTING_UPDATE
+                            if not skip_field_on_existing_update(
+                                k, base_index[exp_val].get(k, "")
+                            )
                         },
                     })
             else:
@@ -824,8 +881,6 @@ def pem_descargar():
                 continue
             for change in item["changes"]:
                 base_col = change["field"]
-                if base_col in SKIP_ON_EXISTING_UPDATE:
-                    continue
                 if base_col not in col_idx_map:
                     continue
                 new_val = item["mapped"].get(base_col)
@@ -861,7 +916,7 @@ def pem_descargar():
                 copy_cell_style(template_cell, cell)
 
                 if base_col in PERCENT_COLUMNS:
-                    cell.value = parse_percent_to_decimal(raw_val)
+                    cell.value = parse_pem_avance_to_decimal(raw_val)
                 else:
                     cell.value = raw_val if raw_val != "" else None
 
