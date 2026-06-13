@@ -88,6 +88,23 @@ def query_dni(dni):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@app.route("/api/consultar-dni", methods=["POST"])
+def consultar_dni_bulk():
+    body = request.get_json()
+    if not body or "dnis" not in body:
+        return jsonify({"error": "Body inválido"}), 400
+
+    results = []
+    for dni in body["dnis"]:
+        nombre, error = query_dni(dni)
+        results.append({
+            "dni": str(dni).strip().zfill(8),
+            "nombre": nombre or "",
+            "error": error,
+        })
+
+    return jsonify({"results": results})
+
 @app.route("/api/upload-excel", methods=["POST"])
 def upload_excel():
     if "file" not in request.files:

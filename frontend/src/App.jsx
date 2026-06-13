@@ -5,6 +5,7 @@ import DropZone from "./components/DropZone";
 import LoadingBar from "./components/LoadingBar";
 import ExcelTable from "./components/ExcelTable";
 import DniValidator from "./components/DniValidator";
+import ConsultaDNI from "./components/ConsultaDNI";
 
 const PALETTE = [
   { btn: "bg-violet-100 text-violet-700 border-violet-300 hover:bg-violet-200", active: "bg-violet-600 text-white border-violet-600" },
@@ -109,13 +110,14 @@ export default function App() {
       <header className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <span className="font-semibold text-gray-800 text-sm">
-            {activeModule === "presupuestos" ? "Formato Presupuestos" : "Avance PEM"}
+            {activeModule === "presupuestos" ? "Formato Presupuestos"
+              : activeModule === "avance-pem" ? "Avance PEM"
+              : "Consulta DNI"}
           </span>
         </div>
 
         <div className="flex items-center gap-3">
           {/* Indicador de proyectista activo */}
-          
           {selectedProyectista && (
             <div className="flex items-center gap-2">
               <span className="text-xs text-gray-400">Proyectista:</span>
@@ -141,9 +143,11 @@ export default function App() {
         </div>
       </header>
 
-      <main className="w-full px-6 py-8">
+      <main className="w-full px-6 py-8 h-full">
         {activeModule === "avance-pem" ? (
           <AvancePEM />
+        ) : activeModule === "consulta-dni" ? (
+          <ConsultaDNI />
         ) : (
           <>
         {state === "idle" && <DropZone onFile={handleFile} />}
